@@ -27,7 +27,8 @@ key = 'enc_key'
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-logger.handlers[0].setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s] %(message)s'))
+logger.handlers[0].setFormatter(logging.Formatter(
+    '[%(asctime)s][%(levelname)s] %(message)s'))
 logging.getLogger('boto3').setLevel(logging.ERROR)
 logging.getLogger('botocore').setLevel(logging.ERROR)
 
@@ -40,7 +41,8 @@ def write_key(filename, contents):
     mode = stat.S_IRUSR | stat.S_IWUSR
     umask_original = os.umask(0)
     try:
-        handle = os.fdopen(os.open(filename, os.O_WRONLY | os.O_CREAT, mode), 'w')
+        handle = os.fdopen(
+            os.open(filename, os.O_WRONLY | os.O_CREAT, mode), 'w')
     finally:
         os.umask(umask_original)
     handle.write(contents + '\n')
@@ -79,7 +81,8 @@ def pull_repo(repo, branch_name, remote_url, creds):
             remote = r
     if not remote_exists:
         remote = repo.create_remote('origin', remote_url)
-    logger.info('Fetching and merging changes from %s branch %s', remote_url, branch_name)
+    logger.info('Fetching and merging changes from %s branch %s',
+                remote_url, branch_name)
     remote.fetch(callbacks=creds)
     if(branch_name.startswith('tags/')):
         ref = 'refs/' + branch_name
@@ -105,7 +108,8 @@ def zip_repo(repo_path, repo_name):
         zdirname = dirname[len(repo_path)+1:]
         zf.write(dirname, zdirname)
         for filename in files:
-            zf.write(os.path.join(dirname, filename), os.path.join(zdirname, filename))
+            zf.write(os.path.join(dirname, filename),
+                     os.path.join(zdirname, filename))
     zf.close()
     return '/tmp/'+repo_name.replace('/', '_')+'.zip'
 
@@ -118,10 +122,54 @@ def push_s3(filename, repo_name, outputbucket):
     logger.info('Completed S3 upload...')
 
 
-def lambda_handler(event, context):
+def is_merged_pullrequest(event):
+    pr_merged = True if 'pullrequest' in event[
+        'body-json'] and event['body-json']['pullrequest']['state'] == 'MERGED' else False
+    return pr_merged
+
+
+def clone_repo_to_s3(event):
+    # S3 Bucket destination and SSH public key cloning the repo
     keybucket = event['context']['key-bucket']
     outputbucket = event['context']['output-bucket']
     pubkey = event['context']['public-key']
+
+    body_json = event['body-json']
+
+    # Build SSH path for cloning
+    full_name = body_json['repository']['full_name']
+    branch_name = body_json['pullrequest']['destination']['branch']['name']
+    repo_name = full_name + '/branch/' + branch_name
+    repo_url = body_json['repository']['links']['html']['href']
+
+    remote_url = 'git@' + repo_url.replace(
+        'https://', '').replace('/', ':', 1)+'.git'
+
+    repo_path = '/tmp/%s' % repo_name
+    creds = RemoteCallbacks(credentials=get_keys(keybucket, pubkey), )
+
+    # Perform repo pull, zip up and ship to S3 bucket
+    try:
+        repository_path = discover_repository(repo_path)
+        repo = Repository(repository_path)
+        logger.info('found existing repo, using that...')
+    except Exception:
+        logger.info('creating new repo for %s in %s' %
+                    (remote_url, repo_path))
+        repo = create_repo(repo_path, remote_url, creds)
+    pull_repo(repo, branch_name, remote_url, creds)
+    zipfile = zip_repo(repo_path, repo_name)
+    push_s3(zipfile, repo_name, outputbucket)
+    if cleanup:
+        logger.info('Cleanup Lambda container...')
+        shutil.rmtree(repo_path)
+        os.remove(zipfile)
+        os.remove('/tmp/id_rsa')
+        os.remove('/tmp/id_rsa.pub')
+    return 'Successfully updated %s' % repo_name
+
+
+def lambda_handler(event, context):
     # Source IP ranges to allow requests from, if the IP is in one of these the request will not be chacked for an api key
     ipranges = []
     for i in event['context']['allowed-ips'].split(','):
@@ -144,59 +192,23 @@ def lambda_handler(event, context):
             secure = True
     if 'X-Hub-Signature' in event['params']['header'].keys():
         for k in apikeys:
-            k1 = hmac.new(str(k), str(event['context']['raw-body']), hashlib.sha1).hexdigest()
-            k2 = str(event['params']['header']['X-Hub-Signature'].replace('sha1=', ''))
+            k1 = hmac.new(str(k), str(
+                event['context']['raw-body']), hashlib.sha1).hexdigest()
+            k2 = str(event['params']['header']
+                     ['X-Hub-Signature'].replace('sha1=', ''))
             if k1 == k2:
                 secure = True
-    # TODO: Add the ability to clone TFS repo using SSH keys
-    try:
-        full_name = event['body-json']['repository']['full_name']
-    except KeyError:
-        try:
-            full_name = event['body-json']['repository']['fullName']
-        except KeyError:
-            full_name = event['body-json']['repository']['path_with_namespace']
+
     if not secure:
-        logger.error('Source IP %s is not allowed' % event['context']['source-ip'])
-        raise Exception('Source IP %s is not allowed' % event['context']['source-ip'])
+        logger.error('Source IP %s is not allowed' %
+                     event['context']['source-ip'])
+        raise Exception('Source IP %s is not allowed' %
+                        event['context']['source-ip'])
 
-    if('action' in event['body-json'] and event['body-json']['action'] == 'published'):
-        branch_name = 'tags/%s' % event['body-json']['release']['tag_name']
-        repo_name = full_name + '/release'
-    else:
-        try:
-            branch_name = 'master'
-            repo_name = event['body-json']['project']['path_with_namespace']
-        except:
-            if 'ref' in event['body-json']:
-                branch_name = event['body-json']['ref'].replace('refs/heads/', '')
-            else:
-                branch_name = 'master'
-            repo_name = full_name + '/branch/' + branch_name
-    try:
-        remote_url = event['body-json']['project']['git_ssh_url']
-    except Exception:
-        try:
-            remote_url = 'git@'+event['body-json']['repository']['links']['html']['href'].replace('https://', '').replace('/', ':', 1)+'.git'
-        except:
-            remote_url = event['body-json']['repository']['ssh_url']
-    repo_path = '/tmp/%s' % repo_name
-    creds = RemoteCallbacks(credentials=get_keys(keybucket, pubkey), )
-    try:
-        repository_path = discover_repository(repo_path)
-        repo = Repository(repository_path)
-        logger.info('found existing repo, using that...')
-    except Exception:
-        logger.info('creating new repo for %s in %s' % (remote_url, repo_path))
-        repo = create_repo(repo_path, remote_url, creds)
-    pull_repo(repo, branch_name, remote_url, creds)
-    zipfile = zip_repo(repo_path, repo_name)
-    push_s3(zipfile, repo_name, outputbucket)
-    if cleanup:
-        logger.info('Cleanup Lambda container...')
-        shutil.rmtree(repo_path)
-        os.remove(zipfile)
-        os.remove('/tmp/id_rsa')
-        os.remove('/tmp/id_rsa.pub')
-    return 'Successfully updated %s' % repo_name
+    if is_merged_pullrequest(event):
+        logger.info("Building off a merged pull request.")
+        return clone_repo_to_s3(event)
 
+    logger.info("No action to be taken")
+
+    return 'No action to be taken'
